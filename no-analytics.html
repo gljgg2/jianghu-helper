@@ -1061,7 +1061,7 @@ button.brand{background:none;border:none;padding:0;cursor:pointer;
 <body>
 
 <header class="top">
-  <button class="btn plain brand" id="hHome" aria-label="回首頁">江湖助手 <span class="ver">1.6.0 無統計</span></button>
+  <button class="btn plain brand" id="hHome" aria-label="回首頁">江湖助手 <span class="ver">1.6.1 無統計</span></button>
   <button class="btn plain" id="hRpTop" type="button">問題回報</button>
 </header>
 
@@ -8639,6 +8639,20 @@ const SECT_PROPS = ['str', 'con', 'dex', 'int'];
 const SECT_SP_LEVELS = [40, 80];
 
 /*
+ * 遊戲第一次讀到出身那張表時，會先把整張表加密一次，那段吃掉這麼多發亂數。
+ * 加密是對每一個「值是數字」的欄位各抽一發；出身表十六列、每列只有一個
+ * 數字欄位，所以剛好十六發。整個程序只做一次。詳細寫在 nameAndBirth 裡。
+ *
+ * **付掉沒有要看玩家那次開遊戲做了什麼。** 全遊戲只有兩個地方讀這張表：
+ * 生弟子，還有生門派每日任務。每日任務那條在跨日重置時跑，一個真實日只跑
+ * 一次，跑在那天第一個進到主場景的程序裡。招募池刷新是另一條時間軸，
+ * 可以發生在後面另一個程序——那時就沒付過，該批第一個被推走。
+ * 〔讀原始碼：生弟子那支與生門派任務那支是僅有的兩個入口，出身表的表名
+ *   全專案只出現在讀它的那支工具裡〕
+ */
+const SECT_BIRTH_TABLE_COST = 16;
+
+/*
  * 更換特長時走的那份候選。天生愚鈍、膽小鬼、小偷小摸這三條掛著門檻值 1，
  * 換成 2 或 3 就會被濾掉。
  *
@@ -8997,21 +9011,59 @@ function sectIdleSpExp(spIds) {
  * **不派任務的話特長經驗只有這一個來源**，所以升到幾階、哪一天升，全部算得死。
  * 排停留天數跟算跨門檻落點都要用同一支，各寫一份的話兩邊的天數會對不起來。
  */
-function sectIdleTicker(spIds, spExp, 基礎) {
+function sectDayBatches(spIds, spExp, baseDayExp) {
   const ids = (spIds || []).slice();
   const exps = (spExp || []).slice();
   return () => {
     /* 加成用當天的階級算，升階發生在結算之後 */
-    const 給 = 基礎 + sectIdleBonus(ids);
-    const 特長加 = sectIdleSpExp(ids);
-    if (特長加 > 0) {
+    const idleShare = sectIdleBonus(ids);
+    const spBonus = sectIdleSpExp(ids);
+    if (spBonus > 0) {
       for (let i = 0; i < ids.length; i++) {
-        const r = sectSpUp(ids[i], (exps[i] || 0) + 特長加);
+        const r = sectSpUp(ids[i], (exps[i] || 0) + spBonus);
         ids[i] = r.id; exps[i] = r.exp;
       }
     }
-    return 給;
+    /*
+     * **兩份要分開發，順序也不能換。** 特長給的那份先結算，門派科技那份後結算，
+     * 各自是一次獨立的加經驗。黏成一包會停在不同的等級，而「第一次到四十級與
+     * 八十級的時候停在幾級」正好決定那一刻長出哪條特長。
+     * 〔讀原始碼：門派每日迴圈先發特長那份，再單獨發一次科技那份〕
+     */
+    const out = [];
+    if (idleShare > 0) out.push(idleShare);
+    if (baseDayExp > 0) out.push(baseDayExp);
+    return out;
   };
+}
+
+/*
+ * 自己等經驗漲上去的話，第一次到四十級與八十級的時候會停在幾級。
+ *
+ * 為什麼只要這兩個數字：一個弟子在任何一級的樣子（加點、身上那幾條、種子）
+ * 完全由這兩個落點決定，中間分幾包吃、停過哪幾級都不影響。
+ * 〔實測：同樣兩個落點、五百六十種不同的分包走法，答案一模一樣〕
+ */
+function sectNaturalCrossings(state, opt) {
+  const o = opt || {};
+  const econ = Object.assign({}, SECT_ECON, o.econ || {});
+  const baseDayExp = o.dayExp ? o.dayExp - sectIdleBonus(state.spIds) : econ.dayExp;
+  const nextDay = sectDayBatches(state.spIds, state.spExp, baseDayExp);
+  const gates = SECT_SP_LEVELS.filter(g => state.level < g);
+  const landing = {};
+  let lv = state.level, e = state.exp || 0, day = 0;
+  while (gates.some(g => landing[g] == null) && day <= (o.maxDays || 4000)) {
+    for (const batch of nextDay()) {
+      const fed = sectFeed(lv, e, batch);
+      lv = fed.level; e = fed.exp;
+      for (const g of gates) if (landing[g] == null && lv >= g) landing[g] = lv;
+    }
+    day += 1;
+    if (lv >= SECT_LEVEL_CAP) break;
+  }
+  /* 走不到的門檻就當剛好踩在門檻上，別讓整條路算不出來 */
+  for (const g of gates) if (landing[g] == null) landing[g] = g;
+  return landing;
 }
 
 /*
@@ -9386,7 +9438,7 @@ class SectStudent {
     if (加 > 0 && this.level < SECT_LEVEL_CAP) {
       const 到 = sectFeed(this.level, this.exp || 0, 加);
       this.exp = 到.exp;
-      if (到.level > this.level) { this.grow(到.level); 升到 = 到.level; }
+      if (到.level > this.level) { this.growOneBatch(到.level); 升到 = 到.level; }
     }
     const one = this.rerollLog(slot, tag, 1)[0];
     /* 跟「洗之前主動升級」分開記：這一個是洗下去自動被推上去的 */
@@ -9459,6 +9511,19 @@ class SectStudent {
     const gi = next(this.sex === 1 ? d.manN : d.womanN);
     this.name = (姓[si - 1] || '') + (名[gi - 1] || '');
     this.seed = next(SECT_BOUND);
+    /*
+     * **遊戲第一次讀到出身那張表的時候，會先把整張表加密一次，那段吃掉十六發亂數。**
+     * 加密是對每一個「值是數字」的欄位各抽一發，出身表十六列、每列只有一個
+     * 數字欄位，所以剛好十六發；而且整個程序只做一次，之後永遠不再做。
+     *
+     * 位置就卡在這裡——抽完名字、推完種子之後，抽出身之前。所以中的那個人
+     * 名字、性別、出生四維、第一條特長全部照舊，只有出身跟後面的種子被推走。
+     * 〔讀原始碼：出身表那支第一次被讀到時會做表格加密，加密對每一個數字欄位
+     *   各抽一發亂數〕
+     * 〔實測：玩家那批第一個補上這十六發之後，出身、入門後種子、第一點加點
+     *   三項跟存檔全中，同一批其餘四個維持正確〕
+     */
+    if (this.先讀表) for (let i = 0; i < SECT_BIRTH_TABLE_COST; i++) next(SECT_BOUND);
     this.birth = d.birth[next(d.birth.length) - 1];
     this.seed = next(SECT_BOUND);
   }
@@ -9501,7 +9566,7 @@ class SectStudent {
    *
    * 換造型一發都不推。遊戲那支動手之前先把種子存進暫存，做完原封不動寫回去。
    */
-  grow(toLevel) {
+  growOneBatch(toLevel) {
     const 舊 = this.level;
     if (toLevel <= 舊) return [];
     this.level = toLevel;
@@ -9511,9 +9576,33 @@ class SectStudent {
     });
     return 加了;
   }
+
+  /*
+   * 自己等經驗漲上去的那一段。**要走這一支，不要拿 growOneBatch 一路長過去。**
+   *
+   * 一次長很多級只有在玩家真的一次領到那麼多經驗的時候才對。自己慢慢升是
+   * 每天發、一天還發兩包，中間會踩在四十級與八十級長出那兩條特長；拿一包
+   * 的算法長過去，那兩條會擠到最後才抽，加點與後面每一條全部跟著錯開。
+   *
+   * crossings 是 sectNaturalCrossings() 算出來的兩個落點。停在哪一級由它決定，
+   * 所以可能停得比 toLevel 高——回傳實際停在幾級，呼叫端要照回傳值走。
+   */
+  growNaturally(toLevel, crossings) {
+    const landing = crossings || {};
+    for (const gate of SECT_SP_LEVELS) {
+      if (this.level >= gate || toLevel < gate) continue;
+      this.growOneBatch(landing[gate] || gate);
+    }
+    if (toLevel > this.level) this.growOneBatch(toLevel);
+    return this.level;
+  }
 }
 
-function sectGen(seed) { return new SectStudent(seed).build(); }
+function sectGen(seed, 先讀表) {
+  const s = new SectStudent(seed);
+  s.先讀表 = !!先讀表;
+  return s.build();
+}
 
 function sectFromState(seed, spIds, level, lvProp, spExp, exp) {
   const s = new SectStudent(seed);
@@ -9526,13 +9615,22 @@ function sectFromState(seed, spIds, level, lvProp, spExp, exp) {
   return s;
 }
 
-/* 招募池：種子先往前滾一格才生一個，滾幾格生幾個。 */
-function sectPool(seed, n) {
+/*
+ * 招募池：種子先往前滾一格才生一個，滾幾格生幾個。
+ *
+ * **每一刷的第一個會多掛一份 `另一種`。** 那一刷五個是連著生的，所以
+ * 「第一次讀出身表」那筆十六發的代價只可能落在第一個身上；付過沒有從存檔
+ * 看不出來，兩種都是可能的答案，交給畫面並排出來讓玩家照出身認。
+ */
+function sectPool(seed, n, perBatch) {
+  const 一刷幾個 = perBatch || 5;
   const out = [];
   let s = Number(seed);
   for (let i = 0; i < n; i++) {
     s = (sectWhale(s) % SECT_BOUND) + 1;
-    out.push(sectGen(s));
+    const st = sectGen(s);
+    if (i % 一刷幾個 === 0) st.另一種 = sectGen(s, true);
+    out.push(st);
   }
   return out;
 }
@@ -9616,9 +9714,20 @@ function sectReachOne(state, targets, keepIds, opt) {
    */
   const snaps = [state.clone()];
   const 跳法 = new Map();
+  /* 自然升上去會在幾級跨過門檻。整條搜尋都靠它，所以算一次帶著走 */
+  const crossings = opt.crossings || sectNaturalCrossings(state, opt);
   {
     const st = state.clone();
-    for (let i = 0; i < maxLevels; i++) { st.grow(st.level + 1); snaps.push(st.clone()); }
+    /*
+     * 一級一級往上，但**跨門檻那一步要照真正的落點跳**——一般弟子剛好踩在
+     * 四十跟八十，掛滿階喜靜勿動的會衝到八十一。停不住的那幾級不進名單。
+     */
+    while (st.level < state.level + maxLevels) {
+      const before = st.level;
+      st.growNaturally(before + 1, crossings);
+      if (st.level <= before) break;
+      snaps.push(st.clone());
+    }
   }
   if (opt.跳等 !== false) {
     for (const r of sectJumpOptions(state, opt)) {
@@ -9700,7 +9809,8 @@ function sectReachOne(state, targets, keepIds, opt) {
         for (const 升到 of 升到們) {
         const 起手 = st.clone();
         const 換級了 = 升到 > 起手.level;
-        if (換級了) 起手.grow(升到);
+        /* 這是玩家自己等經驗漲上來的那一段，走自然升那一支 */
+        起手.growNaturally(升到, crossings);
         /*
          * **那一級停得住幾天，就只洗得了幾次。** 換特長一天一次，
          * 弟子每天自己漲經驗，時間到了就升上去、那一級再也回不來。
@@ -9924,21 +10034,28 @@ function sectJumpOptions(state, opt) {
   const best = new Map();
   for (const 門檻 of SECT_SP_LEVELS) {
     if (state.level >= 門檻) continue;
+    let lv = state.level, e = state.exp || 0, 天 = 0;
+    /*
+     * 一天一天走的時候，人也要跟著長。**不能拿起點那一刻直接長到落點。**
+     * 四十級以下的弟子跳到八十，那樣算等於把兩道門檻併成一次抽；可是畫面印的是
+     * 「自己練到七十九，再交一發跳到八十」——照那樣做，四十那條是走到四十的
+     * 時候就抽掉的，種子位置差了四十發，抽出來的是完全不同的兩條。
+     */
+    const walkState = state.clone();
     /* 同一個落點配同一種手段只留最快的那一天 */
     const 收 = (落點, 天, 怎麼做) => {
       if (落點 < 門檻) return;
       const 鑰 = 門檻 + '|' + 落點 + '|' + (怎麼做 ? 怎麼做.包 : '自己升');
       const 舊 = best.get(鑰);
       if (舊 && 舊.天 <= 天) return;
-      const st = state.clone();
-      st.grow(落點);
+      const st = walkState.clone();
+      st.growOneBatch(落點);
       best.set(鑰, { 門檻, 落點, 天, 令: 怎麼做 ? 怎麼做.令 : 0,
         手段: 怎麼做 ? 怎麼做.包 : '自己升上去', 怎麼做,
         got: st.spIds[st.spIds.length - 1], state: st });
     };
-    let lv = state.level, e = state.exp || 0, 天 = 0;
-    /* 空閒每天長多少會隨喜靜勿動升階變多，所以一天一天問，不用固定值 */
-    const 走一天 = sectIdleTicker(state.spIds, state.spExp,
+    /* 空閒每天發幾包、每包多少會隨喜靜勿動升階變多，所以一天一天問 */
+    const nextDay = sectDayBatches(state.spIds, state.spExp,
       (o.dayExp ? o.dayExp - sectIdleBonus(state.spIds) : econ.dayExp));
     while (lv < 門檻 && 天 <= (o.maxDays || 600)) {
       for (const p of 手段們) {
@@ -9948,8 +10065,12 @@ function sectJumpOptions(state, opt) {
         }
       }
       天 += 1;
-      const 明天 = sectFeed(lv, e, 走一天());
-      lv = 明天.level; e = 明天.exp;
+      /* 一天發兩包就結算兩次，黏成一包會停在不同的等級 */
+      for (const batch of nextDay()) {
+        const fed = sectFeed(lv, e, batch);
+        lv = fed.level; e = fed.exp;
+        if (lv > walkState.level) walkState.growOneBatch(lv);
+      }
     }
     /* 什麼都不做、自己升上去的那一個。它不花令也不花行動力 */
     if (lv >= 門檻) 收(lv, 天, null);
@@ -9992,7 +10113,12 @@ function sectRestLevels(level, exp, dayExp, 空閒) {
    */
   const 逐日 = 空閒 && Array.isArray(空閒.ids) && sectIdleSpExp(空閒.ids) > 0;
   const 底 = 逐日 ? (空閒.基礎 || SECT_ECON.dayExp) : (dayExp || SECT_ECON.dayExp);
-  const 走一天 = 逐日 ? sectIdleTicker(空閒.ids, 空閒.exps, 底) : () => 底;
+  /*
+   * 這裡只問「今天總共長多少」，不問分成幾包——停在哪一級只看累計的量。
+   * 還是走同一支拆包的函式，免得日後兩份各自漂掉。
+   */
+  const 每天幾包 = 逐日 ? sectDayBatches(空閒.ids, 空閒.exps, 底) : () => [底];
+  const 走一天 = () => 每天幾包().reduce((a, x) => a + x, 0);
   const 今天多少 = () => 走一天();
   const days = new Map();
   const 第幾天到 = new Map([[level, 0]]);
@@ -10060,6 +10186,13 @@ function sectSolve(state, wanted, opt) {
    */
   const o = Object.assign({ tag: SECT_TAG_REROLL, maxLevels: SECT_LEVEL_CAP, maxRolls: 15,
     deepRolls: 60, keep: 6 }, opt || {});
+  /*
+   * 自己升上去會在幾級跨門檻，**整條路只算這一次，算完帶著走**。
+   * 落點跟「走到門檻前一級手上還剩多少經驗」有關，中間那些步的狀態不帶剩餘
+   * 經驗，各步重算等於把它當成零，算出來的落點跟玩家真正會走到的不一樣。
+   * 〔實測：同一個弟子從十五級起算落在四十，從二十七級當成零重算就落在四十一〕
+   */
+  if (!o.crossings) o.crossings = sectNaturalCrossings(state, o);
   /* 第一步跟要湊哪一組無關，所以外面算好一次就能給所有疊法共用 */
   const 現成 = o.first;
   const targets = wanted.map(w => sectFirstTier(typeof w === 'number' ? w : sectFind(w)))
@@ -10288,6 +10421,8 @@ function sectDetailWays(stu, wanted, opt) {
   delete o.plan;
   const st = sectStateOf(stu);
   if (!o.levelDays) o.levelDays = sectRestOf(stu, o);
+  /* 跨門檻的落點整條路共用一份，理由寫在 sectSolve 裡 */
+  if (!o.crossings) o.crossings = sectNaturalCrossings(sectStateOf(stu), o);
   const 混 = 名單表那條 || sectSolve(st, wanted, o);
   if (!混) return { 路們: [], 白跑的: [], opt: o };
   /* 練滿的、已經過了八十的，跨不過門檻，推經驗這件事對他沒有意義 */
@@ -10740,7 +10875,25 @@ function sectSimulate(rows, people, econ, opt) {
     for (const a of 演員) {
       if (a.等到 >= day || !a.缺.length) continue;
       const 得 = 派 ? (派.得到.get(a.name) || 0) : 0;
-      a.exp += sectDayExp(e, 得, a.state.spIds);
+      /*
+       * 經驗是一包一包發的，一包結算一次。**不要加總起來再一級一級升**——
+       * 一包夠跨兩級的時候，遊戲是先把級全升完、加點一次補完，才長門檻那條特長。
+       * 〔讀原始碼：加經驗那支先跑完升級迴圈，才補加點、才長門檻那條〕
+       */
+      const 今天幾包 = [];
+      const 空閒那份 = 得 || sectIdleBonus(a.state.spIds);
+      if (空閒那份 > 0) 今天幾包.push(空閒那份);
+      if (e.dayExp > 0) 今天幾包.push(e.dayExp);
+      let 升 = 0;
+      for (const batch of 今天幾包) {
+        const fed = sectFeed(a.state.level, a.exp, batch);
+        a.exp = fed.exp;
+        if (fed.level > a.state.level) {
+          升 += fed.level - a.state.level;
+          a.state.growOneBatch(fed.level);   // 這一步會把序列往後推
+        }
+      }
+      if (升) 今天.事.push({ 型: '升級', 誰: a.name, 幾級: 升, 到: a.state.level });
 
       /*
        * 特長升階只替四條記帳：喜靜勿動改每天長多少，胸懷大志與視器為寶改戰力，
@@ -10763,15 +10916,6 @@ function sectSimulate(rows, people, econ, opt) {
         });
       }
 
-      let 升 = 0;
-      while (a.state.level < SECT_LEVEL_CAP) {
-        const 要 = sectExpNeed(a.state.level, a.state.level + 1);
-        if (要 <= 0 || a.exp < 要) break;
-        a.exp -= 要;
-        a.state.grow(a.state.level + 1);   // 這一步會把序列往後推
-        升++;
-      }
-      if (升) 今天.事.push({ 型: '升級', 誰: a.name, 幾級: 升, 到: a.state.level });
     }
 
     /*
@@ -11441,17 +11585,24 @@ function sectRecruitPool(seed, batches, perBatch) {
   for (let b = 1; b <= batches; b++) {
     for (let i = 0; i < (perBatch || 5); i++) {
       s = (sectWhale(s) % SECT_BOUND) + 1;
-      const st = sectGen(s);
-      st.enroll();
-      out.push({
-        name: st.name || ('新人' + b + '-' + (i + 1)),
-        seed: st.seed, spIds: st.spIds.slice(),
-        level: st.level, lvProp: Object.assign({}, st.lvProp),
-        招: true, 第幾批: b, 等幾天: b,
-        weaponLv: 1, armorLv: 1, power: sectPower(st.level, 1, 1),
-        born: { str: st.bornStr, dex: st.bornDex, con: st.bornCon, int: st.bornInt },
-        tezheng: st.tezheng,
-      });
+      const 擺一個 = 先讀表 => {
+        const st = sectGen(s, 先讀表);
+        st.enroll();
+        return {
+          name: st.name || ('新人' + b + '-' + (i + 1)),
+          seed: st.seed, spIds: st.spIds.slice(),
+          level: st.level, lvProp: Object.assign({}, st.lvProp),
+          birth: st.birth,
+          招: true, 第幾批: b, 等幾天: b,
+          weaponLv: 1, armorLv: 1, power: sectPower(st.level, 1, 1),
+          born: { str: st.bornStr, dex: st.bornDex, con: st.bornCon, int: st.bornInt },
+          tezheng: st.tezheng,
+        };
+      };
+      const 這個 = 擺一個(false);
+      /* 一刷五個連著生，所以那筆十六發的代價只可能落在第一個身上 */
+      if (i === 0) 這個.另一種 = 擺一個(true);
+      out.push(這個);
     }
   }
   return out;
@@ -11555,6 +11706,7 @@ root.Sect = {
   demand: sectDemand, demandCombos: sectDemandCombos, costRow: sectCostRow,
   capacity: sectCapacity, simulate: sectSimulate, gearUp: sectGearUp, ladder: sectLadder,
   restLevels: sectRestLevels, feed: sectFeed, jumpOptions: sectJumpOptions,
+  naturalCrossings: sectNaturalCrossings, dayBatches: sectDayBatches,
   roomAt: sectRoomAt, restOf: sectRestOf, rollsPerLevel: sectRollsPerLevel,
   zhangExp: sectZhangExp, growingBuff: sectGrowingBuff, idleSpExp: sectIdleSpExp,
   pushes: sectPushes, taskExp: sectTaskExp,
@@ -18776,6 +18928,19 @@ function 各種做法(stu, 詳情) {
  * 每一列順便把他練滿一百級的四維算出來：招進門那一發加上逐級加點都吃同一顆種子，
  * 誰練起來會長什麼樣早就定了，跟玩家怎麼養無關。
  */
+/*
+ * 每一刷的第一個為什麼有兩種：遊戲第一次讀到出身那張表時會做一次表格加密，
+ * 那段吃掉十六發亂數，剛好卡在抽名字與抽出身中間。誰在那一刻被生出來，
+ * 誰的種子就被往後推——生成是一刷五個連著跑，所以中的永遠是第一個。
+ * 一個程序只付一次，付過沒有從存檔看不出來，所以兩種都要給。
+ *
+ * **兩種只差在出身與練滿的加點**，名字、性別、出生四維、特長完全一樣。
+ * 出身在遊戲的弟子面板上看得到，所以玩家招進來一眼就分得出是哪一個。
+ */
+const NOTE_POOL_FIRST = '每一刷的第一個有兩種可能，兩列都列出來了：他們只差在出身，'
+  + '其餘一模一樣。招進來之後看弟子面板的出身，就知道是哪一個。其餘四個一定準。'
+  + '想避開的話，當天第一次進遊戲就去刷新，那一次五個都準。';
+
 function 畫招募池() {
   const eng = 恆山引擎();
   if (!eng) return;
@@ -18784,9 +18949,14 @@ function 畫招募池() {
   const 列 = 候選.map((st, i) => {
     const 練滿 = st.clone();
     練滿.enroll();
-    練滿.grow(Sect.LEVEL_CAP);
+    /*
+     * 練滿是自己一天一天升上去的，所以四十級與八十級那兩條特長要在他真的
+     * 走到那一級的時候抽。一口氣長到一百的話那兩發擠到最後才抽，
+     * 後面每一點加點跟著錯開，這一欄就整欄是錯的。
+     */
+    練滿.growNaturally(Sect.LEVEL_CAP, Sect.naturalCrossings(練滿, 恆山選項()));
     const 加點 = Sect.PROPS.map(k => `${PROP_ZH_SECT[k]}${練滿.lvProp[k]}`).join('　');
-    return `<td class="ctr">${i % 5 === 0 ? `第 ${i / 5 + 1} 刷` : ''}</td>`
+    const 主列 = `<td class="ctr">${i % 5 === 0 ? `第 ${i / 5 + 1} 刷` : ''}</td>`
       + `<td class="ctr">${i % 5 + 1}</td>`
       + `<td>${弟子名(st.name)}</td>`
       + `<td class="ctr">${st.sex === 2 ? '女' : '男'}</td>`
@@ -18794,14 +18964,28 @@ function 畫招募池() {
       + `<td class="num">${st.bornStr}</td><td class="num">${st.bornCon}</td>`
       + `<td class="num">${st.bornDex}</td><td class="num">${st.bornInt}</td>`
       + `<td>${st.spIds.length ? 特長名(st.spIds[0]) : ''}</td>`
+      + `<td>${st.birth || ''}</td>`
       + `<td>${加點}</td>`;
-  });
+    if (!st.另一種) return 主列;
+    /*
+     * 第二種只填出身跟加點，其餘留白：那幾欄兩種一模一樣，重複填一次
+     * 會讓人以為是另一個人。
+     */
+    const 另 = st.另一種.clone();
+    另.enroll();
+    另.growNaturally(Sect.LEVEL_CAP, Sect.naturalCrossings(另, 恆山選項()));
+    const 另加點 = Sect.PROPS.map(k => `${PROP_ZH_SECT[k]}${另.lvProp[k]}`).join('　');
+    return [主列, '<td class="ctr"></td><td class="ctr">或</td><td></td><td class="ctr"></td>'
+      + '<td class="num"></td><td class="num"></td><td class="num"></td><td class="num"></td>'
+      + `<td></td><td>${st.另一種.birth || ''}</td><td>${另加點}</td>`];
+  }).flat();
   $('sePoolBody').innerHTML = table(
-    ['4em', '3em', '5.5em', '3em', '3.5em', '3.5em', '3.5em', '3.5em', '9em', ''],
+    ['4em', '3em', '5.5em', '3em', '3.5em', '3.5em', '3.5em', '3.5em', '9em', '5.5em', ''],
     [['第幾刷', 2], ['第幾個', 2], ['名字'], ['性別', 2], ['力', 1], ['體', 1], ['敏', 1],
-      ['智', 1], ['特長'], ['練滿的加點']],
-    列, 5)
+      ['智', 1], ['特長'], ['出身'], ['練滿的加點']],
+    列, 6)
     + '<p class="line">這幾個在你按下刷新之前就定了。每刷新一次換掉五個。</p>'
+    + `<p class="line">${NOTE_POOL_FIRST}</p>`
     + '<div class="bar btns-sm" id="sePoolMore"></div>';
   續算鈕($('sePoolMore'), '再往後 100 個',
     () => { SE.pool += 100; 畫招募池(); });
@@ -18913,8 +19097,13 @@ const 記過這個人 = () => !!記下的那一刻();
 
 const 這個弟子 = () => {
   const 人 = 挑得到的人();
-  const [邊, 位] = String(SR.誰 || '').split(':');
+  const [邊, 位, 另] = String(SR.誰 || '').split(':');
   const 排 = 邊 === '新人' ? 人.新人 : 人.門內;
+  /* 招募池每一刷的第一個有兩種，鑰匙後面多一段「另」認出是哪一個 */
+  if (另 === '另') {
+    const 本 = 排[Number(位)];
+    return (本 && 本.另一種) || null;
+  }
   return 排[Number(位)] || null;
 };
 
@@ -18992,10 +19181,18 @@ function 畫挑人() {
     || 名.indexOf(打的字) >= 0 || 名.indexOf(轉繁的) >= 0;
   const 門內 = 人.門內.map((s, i) => [`門內:${i}`, 弟子名(s.name)])
     .filter(([鑰, 名]) => 找得到(名, 鑰));
-  /* 名字前面帶第幾刷第幾個：他要等到第幾天才刷得出來，看這個就知道 */
-  const 新人 = 人.新人.map((s, i) => [`新人:${i}`,
-    `${s.第幾批}-${i % 5 + 1} ${弟子名(s.name)}`])
-    .filter(([鑰, 名]) => 找得到(名, 鑰));
+  /*
+   * 名字前面帶第幾刷第幾個：他要等到第幾天才刷得出來，看這個就知道。
+   *
+   * **每一刷的第一個列兩筆**，後面附上出身。兩筆只差在出身，招進來看弟子
+   * 面板就分得出是哪一個；挑錯的話後面整條路算的都是別人。
+   */
+  const 新人 = 人.新人.map((s, i) => {
+    const 頭 = `${s.第幾批}-${i % 5 + 1} ${弟子名(s.name)}`;
+    if (!s.另一種) return [[`新人:${i}`, 頭]];
+    return [[`新人:${i}`, `${頭}（出身 ${s.birth}）`],
+      [`新人:${i}:另`, `${頭}（出身 ${s.另一種.birth}）`]];
+  }).flat().filter(([鑰, 名]) => 找得到(名, 鑰));
   if (門內.length) {
     分組框(host, '門內的人', 門內, 鑰 => 鑰 === SR.誰, 挑到,
       () => 畫重算頁(), null, null, true);
@@ -19003,6 +19200,13 @@ function 畫挑人() {
   if (新人.length) {
     分組框(host, '招募池', 新人, 鑰 => 鑰 === SR.誰, 挑到,
       () => 畫重算頁(), null, null, true);
+    /* 挑錯人的話後面整條路都是別人的答案，所以在挑的當下就要講 */
+    const 提醒 = document.createElement('p');
+    提醒.className = 'line';
+    提醒.textContent = '每一刷的第一個有兩種可能，兩筆都列出來了，只差在出身。'
+      + '招進來之後看弟子面板的出身，挑對應的那一筆。其餘四個一定準。'
+      + '想避開的話，當天第一次進遊戲就去刷新，那一次五個都準。';
+    host.appendChild(提醒);
   }
   $('srWhoMore').textContent = '';
   續算鈕($('srWhoMore'), SR.看幾刷
@@ -20673,7 +20877,7 @@ $('rForm').addEventListener('click', () => window.open(RPT_FORM, '_blank', 'noop
  * 內容住在 webui/更新紀錄.txt，那是一份純文字，怎麼寫在它自己的開頭寫著。
  * 這裡只負責把它畫出來，打包的時候才換進來。
  */
-const 更新紀錄 = [{"版":"1.6.0","組":[["新增:角色狀態頁新增修練進度(恆山/血池/歸雲島/書院...等)","新增:武器的裝備詳情新增淬鍊計算功能","新增:匿名統計到訪次數與功能名稱，存檔和計算仍然維持全本地。對不願被統計的用戶提供1.6.x的LTS版","新增:針對單一弟子計算的臨時工具，輸入名字、現況反推後計算專長","新增:裝備配方可以同時選擇多個裝備部位"],["調整:膠囊按鈕格式整理，現在風格為方格膠囊為單選，圓角膠囊為可複選"],["修復:洗脈的輕微bug，現在會正確的禁止一次洗脈內出現多於一條新紫脈"],["新增:給蘿蔔360塊買鹽酥雞"]]},{"版":"1.5.5","組":[["調整:身上有刻苦訓練的弟子，表上寫出升階後要提前幾級洗"]]},{"版":"1.5.4","組":[["修復:裝備沒有實裝提前鎖定精煉詞條的bug"]]},{"版":"1.5.3","組":[["修復:裝備總和詞條篩選異常的bug"]]},{"版":"1.5.2","組":[["預告:洗脈2.0算法即將更新"],["調整:輕微降低恆山新加入弟子的計算耗能，並且現在可以選更多人一起算"],["悲報:蘿蔔的百穿刀跟百免甲同歸於盡了"]]},{"版":"1.5.1","組":[["修復:恆山弟子的等級經驗沒有被計算的問題"]]},{"版":"1.5.0","組":[["新增:重構恆山算法並初步驗證，現在針對弟子升級總共提供四種路徑(自然升/任務/掌門令)，兩種計算法(勤勞每日版和懶人版) 經驗、門派等級、VIP、門派科技樹升級都會正常計算了，不會再出現到不了的等級"],["調整:配合恆山算法，對喜靜勿動、刻苦訓練做了針對調整","調整:外出遊歷的弟子現在也會正確的出現在洗脈欄位"],["修復:有關裝備小數點的問題，經查工具值沒有錯，確定跟遊戲實際生效值相符，只是遊戲UI不顯示，改作為開關讓使用者自行選擇數值顯示方式","修復:現在篩選中選新加入的配方會被一起選擇的問題修復了","修復:戒指找不到聚氣的問題修復了","修復:修正洗脈算法中的一個步驟錯誤，原本已經有脈的少部份角色會受到影響丹數上升"],["新增:給蘿蔔一件一百免內甲"]]},{"版":"1.4.0","組":[["新增:查看單一恆山弟子專長","新增:查看副本","新增:武神殿最高收益/最多紫裝(連鎖)","新增:查看角色"],["調整:輕微調整算法容許更多置換脈序，常規測試中五十組基準中有七組丹量更少"],["修復:紅劍的序列嚴重錯誤","修復:大幅修正及簡化恆山弟子算法條件"],["新增:給蘿蔔一把一百穿切魚刀"]]},{"版":"1.3.3","組":[["調整:紅劍計算有誤，先把紅劍頁面下架"]]},{"版":"1.3.2","組":[["調整:統一恆山UI頁面邏輯，現在跟其他類別操作更類似","調整:弟子預設組別更新","調整:可以查看新招募弟子的姓名"],["調整:上調了蘿蔔摸到大魚的機率"]]},{"版":"1.3.1","組":[["新增:單獨查看單一弟子長序列的功能"],["修復:修復恆山計算bug，現在會正確計算喜聞樂見、任務經驗、派同一個人做多任務、非空閒經驗"],["調整:優化算法，現在會正確的存令，短時間洗特長，弟子終於會互相禮讓別的弟子先洗專長"],["調整:調整了蘿蔔的作息"]]},{"版":"1.3.0","組":[["新增:紅劍(不穩定版)","新增:恆山派弟子(不穩定版)","新增:直接查看背包裝備詳情，無需再透過篩選功能硬選","新增:卡片現在有不存檔的返回鍵了"],["調整:調整開發政策，不再支援未來遊戲存檔","調整:現在刪除只需要按一次，小心!","調整:更新CP值的算法，現在應該更實際了","調整:內部各大程式的邏輯重構，減少維護負擔","調整:內部UI程式的邏輯重構，減少維護負擔","調整:重構UI核心，減少維護負擔"],["修復:某些運算次數偷偷掃十六倍被抓到了","修復:操作性質的輕微問題"],["新增:一張蘿蔔的畢業照片"]]},{"版":"1.2.2","組":[["新增:免責聲明"],["調整:洗脈的下限計算現在會顯示更低的數字，更符合人類肉眼預估值，不影響最終結果","調整:在芒晶的相關提示中新增廟會的文字"],["修復:洗脈現在會正確的看見身上已經準備好的衝突紫脈，核心算法不變，因此仍可能會捨棄該路線(持續關注中)","修復:不再追蹤週年合照裡面的二維化裝備","修復:裝備的邏輯重構，減少維護負擔","修復:操作性質的輕微問題"],["修復:蘿蔔被澆太多水的問題"]]},{"版":"1.2.1","組":[["新增:登入提示"],["調整:稍微改善洗脈的文字說明"],["修復:裝備篩選邏輯，現在塞北的裁縫賣戒指和掛墜卻自己不幫忙打造，導致篩選篩不出來的問題解決了","修復:裝備篩選邏輯，現在當加入多個地區詞條在同個卡片時，只符合非第一個地區詞條的裝備篩選篩不出來的問題解決了","修復:裝備篩選邏輯，當對戒指搜尋道具附加穿甲時，不再會因為詞條沒有穿甲而直接捨棄了，其他裝備同理","修復:裝備篩選邏輯，現在對詞條的搜尋和對道具的搜尋完全拆開，不再會因為搜尋詞條350攻擊而被隕鐵橫空攔截了","修復:裝備篩選邏輯，現在在卡片編輯時，切換部位的當下就會即時切換正確的屬性選單","修復:裝備詞條顯示，現在不會有偽裝成13免詞條的11免內甲了","修復:裝備詞條顯示，現在按照遊戲內顯示方式無條件捨去，並對配合遊戲內顯示畫面對篩選邏輯做輕微的調整","修復:裝備詳情裡沒有正確顯示原生詞條的問題","修復:大量內部邏輯的問題","修復:操作性質的輕微問題"],["修復:蘿蔔沒有被澆到水的問題"]]},{"版":"1.2.0","組":[["新增:問題回報，問題和建議直接開表單回報"],["修復:裝備的附加屬性那一排排不下的時候會換行，不再被切掉","修復:大量內部邏輯的問題","修復:操作性質的輕微問題"],["調整:下調蘿蔔碰見芋頭的機率"]]},{"版":"1.1.4","組":[["調整:調整登入提示的報錯log"],["修復:蘿蔔暈碳的問題"]]},{"版":"1.1.3","組":[["新增:現在登入時新增裝置碼檔的複選提供項目"],["調整:調整登入提示的報錯log"],["修復:操作性質的輕微問題"],["調整:幫蘿蔔點了一盤肉"]]},{"版":"1.1.2","組":[["新增:登入提示的報錯log"],["修復:解決了裝備結算錯誤的計算了不存在的詞條的問題"],["修復:蘿蔔掉進火鍋的問題"]]},{"版":"1.1.1","組":[["首次公開發布"],["調整:讓蘿蔔出差了一天"]]},{"版":"1.1.0","組":[["新增:洗脈可以比較雙更之後的結果","新增:洗脈計算過程會以多核功能加速","新增:現在所有計算過程會先於結果列出來，不用等到全部算完","新增:現在網站會記住使用者的卡片和喜好","新增:裝備詳情頂端補上標籤文字","新增:頁尾倉庫網址"],["調整:洗脈算出來的路線更省丹了","調整:洗脈新增多核功能","調整:洗脈用詞改成白話"],["修復:手機上的頭欄縮成一行，選項排不下就換行","修復:洗脈的組別點下去就能改，不用再多按一步","修復:裝備詳情在兩個頁面之間切換會整頁壞掉","修復:洗脈的下限一直是空的","修復:洗脈的保底紫重新觸發歸零時機的輕微錯誤","修復:保底那張表的用詞改成白話","修復:存檔打不開的時候改講人話，不再丟一串看不懂的字"],["調整:為蘿蔔添了一杯咖啡"]]},{"版":"1.0.0","組":[["新增:第一版——洗脈、打造、找裝備"],["新增:一顆蘿蔔"]]}];
+const 更新紀錄 = [{"版":"1.6.1","組":[["修復:弟子升到40級與80級長出來的特長算錯，40級以下的弟子最嚴重。連帶修正招募池的「練滿的加點」"],["調整:招募池新增出身欄位。每一刷的第一個會列出兩種可能，兩者只差在出身，招進來看弟子面板就分得出是哪一個"]]},{"版":"1.6.0","組":[["新增:角色狀態頁新增修練進度(恆山/血池/歸雲島/書院...等)","新增:武器的裝備詳情新增淬鍊計算功能","新增:匿名統計到訪次數與功能名稱，存檔和計算仍然維持全本地。對不願被統計的用戶提供1.6.x的LTS版","新增:針對單一弟子計算的臨時工具，輸入名字、現況反推後計算專長","新增:裝備配方可以同時選擇多個裝備部位"],["調整:膠囊按鈕格式整理，現在風格為方格膠囊為單選，圓角膠囊為可複選"],["修復:洗脈的輕微bug，現在會正確的禁止一次洗脈內出現多於一條新紫脈"],["新增:給蘿蔔360塊買鹽酥雞"]]},{"版":"1.5.5","組":[["調整:身上有刻苦訓練的弟子，表上寫出升階後要提前幾級洗"]]},{"版":"1.5.4","組":[["修復:裝備沒有實裝提前鎖定精煉詞條的bug"]]},{"版":"1.5.3","組":[["修復:裝備總和詞條篩選異常的bug"]]},{"版":"1.5.2","組":[["預告:洗脈2.0算法即將更新"],["調整:輕微降低恆山新加入弟子的計算耗能，並且現在可以選更多人一起算"],["悲報:蘿蔔的百穿刀跟百免甲同歸於盡了"]]},{"版":"1.5.1","組":[["修復:恆山弟子的等級經驗沒有被計算的問題"]]},{"版":"1.5.0","組":[["新增:重構恆山算法並初步驗證，現在針對弟子升級總共提供四種路徑(自然升/任務/掌門令)，兩種計算法(勤勞每日版和懶人版) 經驗、門派等級、VIP、門派科技樹升級都會正常計算了，不會再出現到不了的等級"],["調整:配合恆山算法，對喜靜勿動、刻苦訓練做了針對調整","調整:外出遊歷的弟子現在也會正確的出現在洗脈欄位"],["修復:有關裝備小數點的問題，經查工具值沒有錯，確定跟遊戲實際生效值相符，只是遊戲UI不顯示，改作為開關讓使用者自行選擇數值顯示方式","修復:現在篩選中選新加入的配方會被一起選擇的問題修復了","修復:戒指找不到聚氣的問題修復了","修復:修正洗脈算法中的一個步驟錯誤，原本已經有脈的少部份角色會受到影響丹數上升"],["新增:給蘿蔔一件一百免內甲"]]},{"版":"1.4.0","組":[["新增:查看單一恆山弟子專長","新增:查看副本","新增:武神殿最高收益/最多紫裝(連鎖)","新增:查看角色"],["調整:輕微調整算法容許更多置換脈序，常規測試中五十組基準中有七組丹量更少"],["修復:紅劍的序列嚴重錯誤","修復:大幅修正及簡化恆山弟子算法條件"],["新增:給蘿蔔一把一百穿切魚刀"]]},{"版":"1.3.3","組":[["調整:紅劍計算有誤，先把紅劍頁面下架"]]},{"版":"1.3.2","組":[["調整:統一恆山UI頁面邏輯，現在跟其他類別操作更類似","調整:弟子預設組別更新","調整:可以查看新招募弟子的姓名"],["調整:上調了蘿蔔摸到大魚的機率"]]},{"版":"1.3.1","組":[["新增:單獨查看單一弟子長序列的功能"],["修復:修復恆山計算bug，現在會正確計算喜聞樂見、任務經驗、派同一個人做多任務、非空閒經驗"],["調整:優化算法，現在會正確的存令，短時間洗特長，弟子終於會互相禮讓別的弟子先洗專長"],["調整:調整了蘿蔔的作息"]]},{"版":"1.3.0","組":[["新增:紅劍(不穩定版)","新增:恆山派弟子(不穩定版)","新增:直接查看背包裝備詳情，無需再透過篩選功能硬選","新增:卡片現在有不存檔的返回鍵了"],["調整:調整開發政策，不再支援未來遊戲存檔","調整:現在刪除只需要按一次，小心!","調整:更新CP值的算法，現在應該更實際了","調整:內部各大程式的邏輯重構，減少維護負擔","調整:內部UI程式的邏輯重構，減少維護負擔","調整:重構UI核心，減少維護負擔"],["修復:某些運算次數偷偷掃十六倍被抓到了","修復:操作性質的輕微問題"],["新增:一張蘿蔔的畢業照片"]]},{"版":"1.2.2","組":[["新增:免責聲明"],["調整:洗脈的下限計算現在會顯示更低的數字，更符合人類肉眼預估值，不影響最終結果","調整:在芒晶的相關提示中新增廟會的文字"],["修復:洗脈現在會正確的看見身上已經準備好的衝突紫脈，核心算法不變，因此仍可能會捨棄該路線(持續關注中)","修復:不再追蹤週年合照裡面的二維化裝備","修復:裝備的邏輯重構，減少維護負擔","修復:操作性質的輕微問題"],["修復:蘿蔔被澆太多水的問題"]]},{"版":"1.2.1","組":[["新增:登入提示"],["調整:稍微改善洗脈的文字說明"],["修復:裝備篩選邏輯，現在塞北的裁縫賣戒指和掛墜卻自己不幫忙打造，導致篩選篩不出來的問題解決了","修復:裝備篩選邏輯，現在當加入多個地區詞條在同個卡片時，只符合非第一個地區詞條的裝備篩選篩不出來的問題解決了","修復:裝備篩選邏輯，當對戒指搜尋道具附加穿甲時，不再會因為詞條沒有穿甲而直接捨棄了，其他裝備同理","修復:裝備篩選邏輯，現在對詞條的搜尋和對道具的搜尋完全拆開，不再會因為搜尋詞條350攻擊而被隕鐵橫空攔截了","修復:裝備篩選邏輯，現在在卡片編輯時，切換部位的當下就會即時切換正確的屬性選單","修復:裝備詞條顯示，現在不會有偽裝成13免詞條的11免內甲了","修復:裝備詞條顯示，現在按照遊戲內顯示方式無條件捨去，並對配合遊戲內顯示畫面對篩選邏輯做輕微的調整","修復:裝備詳情裡沒有正確顯示原生詞條的問題","修復:大量內部邏輯的問題","修復:操作性質的輕微問題"],["修復:蘿蔔沒有被澆到水的問題"]]},{"版":"1.2.0","組":[["新增:問題回報，問題和建議直接開表單回報"],["修復:裝備的附加屬性那一排排不下的時候會換行，不再被切掉","修復:大量內部邏輯的問題","修復:操作性質的輕微問題"],["調整:下調蘿蔔碰見芋頭的機率"]]},{"版":"1.1.4","組":[["調整:調整登入提示的報錯log"],["修復:蘿蔔暈碳的問題"]]},{"版":"1.1.3","組":[["新增:現在登入時新增裝置碼檔的複選提供項目"],["調整:調整登入提示的報錯log"],["修復:操作性質的輕微問題"],["調整:幫蘿蔔點了一盤肉"]]},{"版":"1.1.2","組":[["新增:登入提示的報錯log"],["修復:解決了裝備結算錯誤的計算了不存在的詞條的問題"],["修復:蘿蔔掉進火鍋的問題"]]},{"版":"1.1.1","組":[["首次公開發布"],["調整:讓蘿蔔出差了一天"]]},{"版":"1.1.0","組":[["新增:洗脈可以比較雙更之後的結果","新增:洗脈計算過程會以多核功能加速","新增:現在所有計算過程會先於結果列出來，不用等到全部算完","新增:現在網站會記住使用者的卡片和喜好","新增:裝備詳情頂端補上標籤文字","新增:頁尾倉庫網址"],["調整:洗脈算出來的路線更省丹了","調整:洗脈新增多核功能","調整:洗脈用詞改成白話"],["修復:手機上的頭欄縮成一行，選項排不下就換行","修復:洗脈的組別點下去就能改，不用再多按一步","修復:裝備詳情在兩個頁面之間切換會整頁壞掉","修復:洗脈的下限一直是空的","修復:洗脈的保底紫重新觸發歸零時機的輕微錯誤","修復:保底那張表的用詞改成白話","修復:存檔打不開的時候改講人話，不再丟一串看不懂的字"],["調整:為蘿蔔添了一杯咖啡"]]},{"版":"1.0.0","組":[["新增:第一版——洗脈、打造、找裝備"],["新增:一顆蘿蔔"]]}];
 
 function paintU() {
   const host = $('uRows'); host.textContent = '';
